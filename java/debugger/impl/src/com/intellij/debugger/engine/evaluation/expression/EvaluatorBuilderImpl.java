@@ -1292,8 +1292,25 @@ public final class EvaluatorBuilderImpl implements EvaluatorBuilder {
         else {
           anticipatedReturnType = objectType;
         }
-        Evaluator invoker = pickInvoker(psiMethod, argExpressions, objectEvaluator, anticipatedReturnType);
-        Evaluator[] args = ArrayUtil.prepend(objectEvaluator, argumentEvaluators);
+        // for VarHandle, we must avoid evaluation the qualifier twice
+        Evaluator cachingObjectEvaluator = new Evaluator() {
+          private static final Object NOT_CACHED = new Object();
+          private Object cached = NOT_CACHED;
+          @Override
+          public Object evaluate(EvaluationContextImpl context) throws EvaluateException {
+            if (cached == NOT_CACHED) {
+              cached = objectEvaluator.evaluate(context);
+            }
+            return cached;
+          }
+
+          @Override
+          public Modifier getModifier() {
+            return objectEvaluator.getModifier();
+          }
+        };
+        Evaluator invoker = pickInvoker(psiMethod, argExpressions, cachingObjectEvaluator, anticipatedReturnType);
+        Evaluator[] args = ArrayUtil.prepend(cachingObjectEvaluator, argumentEvaluators);
         myResult =
           new MethodEvaluator(invoker, null, "invokeWithArguments", JVMNameUtil.getJVMSignature(psiInvokeWithArguments), args, true);
         if (anticipatedReturnType instanceof PsiPrimitiveType && !anticipatedReturnType.equals(PsiTypes.voidType())) {
