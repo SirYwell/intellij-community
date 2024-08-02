@@ -6,6 +6,7 @@
  */
 package com.intellij.debugger.engine.evaluation.expression;
 
+import com.intellij.codeInsight.AnnotationUtil;
 import com.intellij.codeInsight.daemon.JavaErrorBundle;
 import com.intellij.codeInsight.daemon.impl.HighlightInfo;
 import com.intellij.codeInsight.daemon.impl.analysis.HighlightUtil;
@@ -41,7 +42,9 @@ import org.jetbrains.annotations.Contract;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
+import java.lang.invoke.VarHandle;
 import java.util.*;
+import java.util.stream.Collectors;
 
 public final class EvaluatorBuilderImpl implements EvaluatorBuilder {
   private static final EvaluatorBuilderImpl ourInstance = new EvaluatorBuilderImpl();
@@ -1267,15 +1270,133 @@ public final class EvaluatorBuilderImpl implements EvaluatorBuilder {
       }
 
       boolean mustBeVararg = false;
+      boolean isSignaturePolymorphic = false;
 
       if (psiMethod != null) {
+        isSignaturePolymorphic = AnnotationUtil.isAnnotated(psiMethod, CommonClassNames.JAVA_LANG_INVOKE_MH_POLYMORPHIC, 0);
         processBoxingConversions(psiMethod.getParameterList().getParameters(), argExpressions, resolveResult.getSubstitutor(), argumentEvaluators);
         mustBeVararg = psiMethod.isVarArgs();
+      }
+      if (isSignaturePolymorphic) {
+        PsiType anticipatedReturnType;
+        PsiClassType objectType = PsiType.getJavaLangObject(expression.getManager(), expression.getResolveScope());
+        if (!objectType.equals(psiMethod.getReturnType())) {
+          anticipatedReturnType = psiMethod.getReturnType(); // e.g. boolean, void in VarHandle methods
+        }
+        else if (expression.getParent() instanceof PsiTypeCastExpression cast) {
+          anticipatedReturnType = cast.getCastType().getType(); // the user wants this return type explicitly
+        }
+        else {
+          anticipatedReturnType = objectType;
+        }
+        myResult = buildInvokerBasedCode(psiMethod, argExpressions, anticipatedReturnType, qualifier);
+        if (anticipatedReturnType instanceof PsiPrimitiveType && !anticipatedReturnType.equals(PsiTypes.voidType())) {
+          myResult = new UnBoxingEvaluator(myResult);
+        }
+        return;
       }
 
       myResult = new MethodEvaluator(objectEvaluator, contextClass, methodExpr.getReferenceName(),
                                      psiMethod != null ? JVMNameUtil.getJVMSignature(psiMethod) : null, argumentEvaluators,
                                      mustBeVararg);
+    }
+
+    private Evaluator buildInvokerBasedCode(PsiMethod psiMethod,
+                                            PsiExpression[] arguments,
+                                            PsiType anticipatedReturnType,
+                                            PsiExpression qualifier) {
+      String methodTypeCode = buildMethodTypeCode(arguments, anticipatedReturnType);
+      String invokerCode = switch (psiMethod.getContainingClass().getName()) {
+        case "MethodHandle" -> {
+          String invokerMethodName = psiMethod.getName().equals("invoke") ? "invoker" : "exactInvoker";
+          yield "MethodHandles." + invokerMethodName + "(" + methodTypeCode + ")";
+        }
+        case "VarHandle" -> {
+          String accessModeName = VarHandle.AccessMode.valueFromMethodName(psiMethod.getName()).name();
+          String args = "(VarHandle.AccessMode." + accessModeName + ", " + methodTypeCode + ")";
+          yield qualifier.getText() + ".hasInvokeExactBehavior() ? "
+                + "MethodHandles.varHandleExactInvoker" + args + " : "
+                + "MethodHandles.varHandleInvoker" + args;
+        }
+        default -> throw evaluateException("unsupported signature polymorphic method " + psiMethod);
+      };
+      String invokeWithArguments = invokerCode + ".invokeWithArguments(" + qualifier + ", "
+                                   + Arrays.stream(arguments).map(PsiExpression::getText).collect(Collectors.joining(", ")) + ")";
+      return buildFromJavaCode(invokeWithArguments,
+                               "java.lang.invoke.MethodHandles," +
+                               "java.lang.invoke.VarHandle," +
+                               "java.lang.invoke.MethodType",
+                               qualifier);
+    }
+
+    private static String buildMethodTypeCode(PsiExpression[] arguments, PsiType anticipatedReturnType) {
+      String params = Arrays.stream(arguments).map(PsiExpression::getType)
+        .map(PsiType::getCanonicalText)
+        .map(text -> text + ".class")
+        .collect(Collectors.joining(", "));
+      return "MethodType.methodType(" + anticipatedReturnType.getCanonicalText() + ".class, " + params + ")";
+    }
+
+    private static Evaluator pickInvoker(PsiMethod method,
+                                         PsiExpression[] argExpressions,
+                                         Evaluator qualifier,
+                                         PsiType anticipatedReturnType) {
+      PsiClassType methodHandlesType =
+        PsiType.getTypeByName("java.lang.invoke.MethodHandles", method.getProject(), method.getResolveScope());
+      PsiClass methodHandlesClass = Objects.requireNonNull(methodHandlesType.resolve(), "MethodHandles class is missing");
+      JVMName methodHandlesTypeName = JVMNameUtil.getJVMQualifiedName(methodHandlesType);
+      Evaluator methodTypeEvaluator = buildMethodType(method, argExpressions, anticipatedReturnType);
+      if ("MethodHandle".equals(Objects.requireNonNull(method.getContainingClass()).getName())) {
+        String invokerMethodName = method.getName().equals("invoke") ? "invoker" : "exactInvoker";
+        PsiMethod[] invoker = methodHandlesClass.findMethodsByName(invokerMethodName, false);
+        return buildStaticCall(methodHandlesTypeName, invoker[0], methodTypeEvaluator);
+      }
+      else if ("VarHandle".equals(method.getContainingClass().getName())) {
+        // invocations of signature polymorphic methods can be exact or not depending on the VarHandle's state, so we need to pick
+        // the right method dynamically
+        PsiClassType varHandleType = PsiType.getTypeByName("java.lang.invoke.VarHandle", method.getProject(), method.getResolveScope());
+        PsiMethod hasInvokeExactBehaviorMethod = varHandleType.resolve().findMethodsByName("hasInvokeExactBehavior", false)[0];
+
+        MethodEvaluator hasInvokeExactBehavior =
+          new MethodEvaluator(qualifier, null, "hasInvokeExactBehavior", JVMNameUtil.getJVMSignature(hasInvokeExactBehaviorMethod),
+                              new Evaluator[0]);
+        PsiClassType accessModeType =
+          PsiType.getTypeByName("java.lang.invoke.VarHandle.AccessMode", method.getProject(), method.getResolveScope());
+        TypeEvaluator accessModeTypeEvaluator = new TypeEvaluator(JVMNameUtil.getJVMQualifiedName(accessModeType));
+        Evaluator accessModeEvaluator = new FieldEvaluator(accessModeTypeEvaluator, FieldEvaluator.createClassFilter(accessModeType),
+                                                           VarHandle.AccessMode.valueFromMethodName(method.getName()).name());
+        Evaluator[] args = {accessModeEvaluator, methodTypeEvaluator};
+        PsiMethod varHandleExactInvoker = methodHandlesClass.findMethodsByName("varHandleExactInvoker", false)[0];
+        PsiMethod varHandleInvoker = methodHandlesClass.findMethodsByName("varHandleInvoker", false)[0];
+        Evaluator ifExact = buildStaticCall(methodHandlesTypeName, varHandleExactInvoker, args);
+        Evaluator otherwise = buildStaticCall(methodHandlesTypeName, varHandleInvoker, args);
+        return new ConditionalExpressionEvaluator(hasInvokeExactBehavior, ifExact, otherwise);
+      }
+      return null;
+    }
+
+    private static @NotNull MethodEvaluator buildStaticCall(JVMName className, PsiMethod method, Evaluator... args) {
+      return new MethodEvaluator(new TypeEvaluator(className), className, method.getName(), JVMNameUtil.getJVMSignature(method), args);
+    }
+
+    private static Evaluator buildMethodType(PsiMethod context, PsiExpression[] arguments, PsiType anticipatedReturnType) {
+      Evaluator[] evaluators = new Evaluator[arguments.length];
+      for (int i = 0; i < evaluators.length; i++) {
+        evaluators[i] = buildDotClassEvaluator(arguments[i].getType());
+      }
+      // MethodType.methodType() methods have several overloads, but none that takes varargs directly
+      // so we use MethodType.methodType(Class, Class[]). But that means we need to create an array manually
+      PsiClassType classType = PsiType.getJavaLangClass(context.getManager(), context.getResolveScope());
+      NewArrayInstanceEvaluator parameters =
+        new NewArrayInstanceEvaluator(new TypeEvaluator(JVMNameUtil.getJVMQualifiedName(classType.createArrayType())),
+                                      null,
+                                      new ArrayInitializerEvaluator(evaluators));
+      Evaluator returnType = buildDotClassEvaluator(anticipatedReturnType);
+      PsiClassType methodTypeType = PsiType.getTypeByName("java.lang.invoke.MethodType", context.getProject(), context.getResolveScope());
+      PsiMethod methodTypeMethod = ContainerUtil.find(methodTypeType.resolve().findMethodsByName("methodType", false),
+                                                      method -> method.getParameters().length == 2 &&
+                                                                method.getParameters()[1].getType() instanceof PsiArrayType);
+      return buildStaticCall(JVMNameUtil.getJVMQualifiedName(methodTypeType), methodTypeMethod, returnType, parameters);
     }
 
     @Override
@@ -1397,12 +1518,16 @@ public final class EvaluatorBuilderImpl implements EvaluatorBuilder {
     public void visitClassObjectAccessExpression(@NotNull PsiClassObjectAccessExpression expression) {
       PsiType type = expression.getOperand().getType();
 
+      myResult = buildDotClassEvaluator(type);
+    }
+
+    private static Evaluator buildDotClassEvaluator(PsiType type) {
       if (type instanceof PsiPrimitiveType) {
         final JVMName typeName = JVMNameUtil.getJVMRawText(((PsiPrimitiveType)type).getBoxedTypeName());
-        myResult = new FieldEvaluator(new TypeEvaluator(typeName), FieldEvaluator.TargetClassFilter.ALL, "TYPE");
+        return new FieldEvaluator(new TypeEvaluator(typeName), FieldEvaluator.TargetClassFilter.ALL, "TYPE");
       }
       else {
-        myResult = new ClassObjectEvaluator(new TypeEvaluator(JVMNameUtil.getJVMQualifiedName(type)));
+        return new ClassObjectEvaluator(new TypeEvaluator(JVMNameUtil.getJVMQualifiedName(type)));
       }
     }
 
